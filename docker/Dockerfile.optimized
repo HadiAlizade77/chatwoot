@@ -1,0 +1,108 @@
+# Optimized Dockerfile for Chatwoot production build
+FROM node:23-alpine AS node
+FROM ruby:3.4.4-alpine3.21 AS builder
+
+# Set environment variables for production build
+ENV RAILS_ENV=production
+ENV BUNDLE_WITHOUT="development:test"
+ENV RAILS_SERVE_STATIC_FILES=true
+ENV BUNDLE_FORCE_RUBY_PLATFORM=1
+ENV NODE_OPTIONS="--max-old-space-size=6144"
+ENV BUNDLER_VERSION=2.5.11
+ENV BUNDLE_PATH="/gems"
+
+# Install system dependencies
+RUN apk update && apk add --no-cache \
+    build-base \
+    openssl \
+    tar \
+    tzdata \
+    postgresql-dev \
+    postgresql-client \
+    git \
+    curl \
+    xz \
+    vips \
+    imagemagick \
+    musl-dev \
+    linux-headers \
+    && gem install bundler
+
+# Copy Node.js from node image
+COPY --from=node /usr/local/bin/node /usr/local/bin/
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && npm install -g pnpm@10.2.0
+
+# Set working directory
+WORKDIR /app
+
+# Copy dependency files
+COPY Gemfile Gemfile.lock package.json pnpm-lock.yaml ./
+
+# Configure Ruby platform
+RUN bundle config set --local force_ruby_platform true
+
+# Install Ruby dependencies
+RUN bundle config set without 'development test' && bundle install -j $(nproc) --retry 3
+
+# Install Node.js dependencies
+RUN pnpm install --frozen-lockfile --production
+
+# Copy application code
+COPY . .
+
+# Create log directory
+RUN mkdir -p /app/log
+
+# Build assets with increased memory
+RUN SECRET_KEY_BASE=precompile_placeholder \
+    RAILS_LOG_TO_STDOUT=enabled \
+    NODE_OPTIONS="--max-old-space-size=6144" \
+    bundle exec rake assets:precompile
+
+# Generate git SHA
+RUN echo "production-build-$(date +%s)" > /app/.git_sha
+
+# Clean up
+RUN rm -rf \
+    spec \
+    node_modules \
+    tmp/cache \
+    /gems/ruby/3.4.0/cache/*.gem \
+    .git \
+    .gitignore
+
+# Final production image
+FROM ruby:3.4.4-alpine3.21
+
+ENV RAILS_ENV=production
+ENV BUNDLE_WITHOUT="development:test"
+ENV RAILS_SERVE_STATIC_FILES=true
+ENV BUNDLER_VERSION=2.5.11
+ENV BUNDLE_PATH="/gems"
+ENV EXECJS_RUNTIME="Disabled"
+
+# Install runtime dependencies only
+RUN apk update && apk add --no-cache \
+    tzdata \
+    postgresql-client \
+    imagemagick \
+    vips \
+    && gem install bundler
+
+# Copy built application and gems from builder stage
+COPY --from=builder /gems/ /gems/
+COPY --from=builder /app /app
+
+WORKDIR /app
+
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Default command
+CMD ["bundle", "exec", "puma", "-C", "config/puma.rb"]
